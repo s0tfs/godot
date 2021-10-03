@@ -307,6 +307,8 @@ TileSet::TerrainsPattern::TerrainsPattern(const TileSet *p_tile_set, int p_terra
 }
 
 const int TileSet::INVALID_SOURCE = -1;
+const int TileSet::INVALID_TERRAIN_SET = -1;
+const int TileSet::INVALID_TERRAIN_INDEX = -1;
 
 const char *TileSet::CELL_NEIGHBOR_ENUM_TO_TEXT[] = {
 	"right_side",
@@ -5120,6 +5122,23 @@ int TileData::get_terrain_set() const {
 	return terrain_set;
 }
 
+void TileData::set_terrain_index(int p_terrain_index) {
+	ERR_FAIL_COND(p_terrain_index < -1);
+	if (tile_set) {
+		ERR_FAIL_COND(p_terrain_index >= tile_set->get_terrains_count(terrain_set));
+	}
+	if (p_terrain_index == terrain_index) {
+		return;
+	}
+	terrain_index = p_terrain_index;
+	notify_property_list_changed();
+	emit_signal(SNAME("changed"));
+}
+
+int TileData::get_terrain_index() const {
+	return terrain_index;
+}
+
 void TileData::set_peering_bit_terrain(TileSet::CellNeighbor p_peering_bit, int p_terrain_index) {
 	ERR_FAIL_INDEX(p_peering_bit, TileSet::CellNeighbor::CELL_NEIGHBOR_MAX);
 	ERR_FAIL_COND(terrain_set < 0);
@@ -5537,6 +5556,8 @@ void TileData::_bind_methods() {
 	// Terrain
 	ClassDB::bind_method(D_METHOD("set_terrain_set", "terrain_set"), &TileData::set_terrain_set);
 	ClassDB::bind_method(D_METHOD("get_terrain_set"), &TileData::get_terrain_set);
+	ClassDB::bind_method(D_METHOD("set_terrain_index", "terrain_index"), &TileData::set_terrain_index);
+	ClassDB::bind_method(D_METHOD("get_terrain_index"), &TileData::get_terrain_index);
 	ClassDB::bind_method(D_METHOD("set_peering_bit_terrain", "peering_bit", "terrain"), &TileData::set_peering_bit_terrain);
 	ClassDB::bind_method(D_METHOD("get_peering_bit_terrain", "peering_bit"), &TileData::get_peering_bit_terrain);
 
@@ -5566,6 +5587,7 @@ void TileData::_bind_methods() {
 
 	ADD_GROUP("Terrains", "");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "terrain_set"), "set_terrain_set", "get_terrain_set");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "terrain_index"), "set_terrain_index", "get_terrain_index");
 
 	ADD_GROUP("Miscellaneous", "");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "probability"), "set_probability", "get_probability");

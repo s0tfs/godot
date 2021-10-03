@@ -338,6 +338,17 @@ public:
 	Map<Vector2i, TileSet::TerrainsPattern> terrain_wave_function_collapse(const Set<Vector2i> &p_to_replace, int p_terrain_set, const Set<TerrainConstraint> p_constraints); // Not exposed.
 	void set_cells_from_surrounding_terrains(int p_layer, TypedArray<Vector2i> p_coords_array, int p_terrain_set, bool p_ignore_empty_terrains = true);
 
+	// Set Cell Terrains
+	void set_cell_terrain(int p_layer, const Vector2i &p_coords, int p_terrain_set, int p_terrain_index);
+	int get_cell_terrain_set(int p_layer, const Vector2i &p_coords, bool p_use_proxies = false);
+	int get_cell_terrain_index(int p_layer, const Vector2i &p_coords, bool p_use_proxies = false);
+
+	void update_cell_terrain_region(int p_layer, Rect2i p_region = Rect2i(), bool p_use_proxies = false);
+	// Not exposed to users.
+	void update_cell_terrain(int p_layer, const Vector2i &p_coords, bool p_use_proxies = false);
+	TileData *get_cell_tile_data(int p_layer, const Vector2i &p_coords, bool p_use_proxies = false);
+	TileMapCell find_terrain_tile(int p_terrain_set, int p_terrain_index, const int *needed_peering_bits = nullptr);
+
 	// Not exposed to users
 	TileMapCell get_cell(int p_layer, const Vector2i &p_coords, bool p_use_proxies = false) const;
 	Map<Vector2i, TileMapQuadrant> *get_quadrant_map(int p_layer);

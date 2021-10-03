@@ -2383,6 +2383,576 @@ void TileMap::set_cells_from_surrounding_terrains(int p_layer, TypedArray<Vector
 	}
 }
 
+// Set Cell Terrains
+
+void TileMap::set_cell_terrain(int p_layer, const Vector2i &p_coords, int p_terrain_set, int p_terrain_index) {
+	ERR_FAIL_INDEX(p_layer, (int)layers.size());
+	if (p_terrain_set == -1) {
+		set_cell(p_layer, p_coords, TileSet::INVALID_SOURCE, TileSetSource::INVALID_ATLAS_COORDS, TileSetSource::INVALID_TILE_ALTERNATIVE);
+		return;
+	}
+	TileMapCell tile = find_terrain_tile(p_terrain_set, p_terrain_index);
+	set_cell(p_layer, p_coords, tile.source_id, tile.get_atlas_coords(), tile.alternative_tile);
+}
+
+int TileMap::get_cell_terrain_set(int p_layer, const Vector2i &p_coords, bool p_use_proxies) {
+	TileData *tile_data = get_cell_tile_data(p_layer, p_coords, p_use_proxies);
+	if (tile_data) {
+		return tile_data->get_terrain_set();
+	} else {
+		return -1;
+	}
+}
+int TileMap::get_cell_terrain_index(int p_layer, const Vector2i &p_coords, bool p_use_proxies) {
+	TileData *tile_data = get_cell_tile_data(p_layer, p_coords, p_use_proxies);
+	if (tile_data) {
+		return tile_data->get_terrain_index();
+	} else {
+		return -1;
+	}
+}
+
+void TileMap::update_cell_terrain_region(int p_layer, Rect2i p_region, bool p_use_proxies) {
+	class CellNeighborIterator {
+		Ref<TileSet> tile_set;
+		Set<int> valid_peering_bits;
+		Set<int>::Iterator it;
+
+	public:
+		CellNeighborIterator(Ref<TileSet> tile_Set) :
+				tile_set(tile_Set) {
+			for (int peering_bit = 0; peering_bit < TileSet::CELL_NEIGHBOR_MAX; peering_bit++) {
+				if (tile_set->is_valid_peering_bit_for_mode(TileSet::TERRAIN_MODE_MATCH_CORNERS_AND_SIDES, (TileSet::CellNeighbor)peering_bit)) {
+					valid_peering_bits.insert(peering_bit);
+				}
+			}
+			it = valid_peering_bits.begin();
+		}
+		bool has_next() const {
+			return it != nullptr;
+		}
+		TileSet::CellNeighbor get_next() {
+			Set<int>::Iterator old_it(it);
+			++it;
+			return TileSet::CellNeighbor(*old_it);
+		}
+
+		TileSet::CellNeighbor get_successor_ccw(int i) const {
+			ERR_FAIL_COND_V(!valid_peering_bits.has(i), TileSet::CellNeighbor(i));
+			const Set<int>::Element *prev = valid_peering_bits.find(i)->prev();
+			return TileSet::CellNeighbor(prev != nullptr ? prev->get() : valid_peering_bits.back()->get());
+		}
+		TileSet::CellNeighbor get_successor_cw(int i) const {
+			ERR_FAIL_COND_V(!valid_peering_bits.has(i), TileSet::CellNeighbor(i));
+			const Set<int>::Element *next = valid_peering_bits.find(i)->next();
+			return TileSet::CellNeighbor(next != nullptr ? next->get() : valid_peering_bits.front()->get());
+		}
+		TileSet::CellNeighbor get_opposing_peering_bit(int bit) const {
+			return TileSet::CellNeighbor((bit + TileSet::CELL_NEIGHBOR_MAX / 2) % TileSet::CELL_NEIGHBOR_MAX);
+		}
+		bool is_side(int bit) const {
+			return (bit % 2) == 0;
+		}
+		void reset() {
+			it = valid_peering_bits.begin();
+		}
+	};
+	struct Rules {
+		struct Tile {
+			int terrain_set = TileSet::INVALID_TERRAIN_SET;
+			int terrain_index = TileSet::INVALID_TERRAIN_INDEX;
+			int peering_bits[16] = { -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 };
+
+			Tile() {}
+			Tile(TileData *tile_data) {
+				if (!tile_data) {
+					for (int i = 0; i < TileSet::CELL_NEIGHBOR_MAX; i++) {
+						peering_bits[i] = TileSet::INVALID_TERRAIN_INDEX;
+					}
+				} else {
+					terrain_set = tile_data->get_terrain_set();
+					terrain_index = tile_data->get_terrain_index();
+					for (int i = 0; i < TileSet::CELL_NEIGHBOR_MAX; i++) {
+						if (tile_data->is_valid_peering_bit_terrain(TileSet::CellNeighbor(i))) {
+							peering_bits[i] = tile_data->get_peering_bit_terrain(TileSet::CellNeighbor(i));
+						}
+					}
+				}
+			}
+
+			bool operator<(const Tile &p_other) const {
+				if (terrain_set > p_other.terrain_set) {
+					return true;
+				} else if (terrain_set == p_other.terrain_set) {
+					if (terrain_index < p_other.terrain_index) {
+						return true;
+					} else if (terrain_index == p_other.terrain_index) {
+						for (int i = 0; i < TileSet::CELL_NEIGHBOR_MAX; i++) {
+							if (peering_bits[i] < p_other.peering_bits[i]) {
+								return true;
+							} else if (peering_bits[i] == p_other.peering_bits[i]) {
+								continue;
+							} else {
+								return false;
+							}
+						}
+						return false;
+					} else {
+						return false;
+					}
+				} else {
+					return false;
+				}
+			}
+		};
+		const Ref<TileSet> tile_set;
+		Map<int, Tile> tiles_by_id;
+		Map<int, Map<TileSet::CellNeighbor, Set<int>>> adjacency_rules;
+		Map<Tile, Vector<TileMapCell>> tile_map_cells_by_tile;
+		Map<int, Set<int>> ids_by_terrain_set;
+		Map<int, Map<int, Set<int>>> ids_by_terrain;
+		Set<int> all_tile_ids;
+		int next_tile_id = 0;
+		int empty_tile_id;
+
+		void add_tile(TileData *p_tile_data, int p_source_id, Vector2i p_atlas_coords, int p_alt_tile_id) {
+			Tile new_tile(p_tile_data);
+			if (!tile_map_cells_by_tile.has(new_tile)) {
+				tiles_by_id[next_tile_id] = new_tile;
+				tile_map_cells_by_tile[new_tile];
+				ids_by_terrain_set[new_tile.terrain_set].insert(next_tile_id);
+				ids_by_terrain[new_tile.terrain_set][new_tile.terrain_index].insert(next_tile_id);
+				all_tile_ids.insert(next_tile_id++);
+			}
+			tile_map_cells_by_tile[new_tile].push_back({ p_source_id, p_atlas_coords, p_alt_tile_id });
+		}
+
+		Rules(const Ref<TileSet> &tile_set) :
+				tile_set(tile_set) {
+			// Gather Terrain Tiles;
+			for (int source_id = 0; source_id < tile_set->get_source_count(); source_id++) {
+				Ref<TileSetAtlasSource> tile_set_atlas_source = tile_set->get_source(source_id);
+				if (tile_set_atlas_source.is_valid()) {
+					for (int tile_id = 0; tile_id < tile_set_atlas_source->get_tiles_count(); tile_id++) {
+						Vector2i atlas_coords = tile_set_atlas_source->get_tile_id(tile_id);
+						for (int alt_tile_id = 0; alt_tile_id < tile_set_atlas_source->get_alternative_tiles_count(atlas_coords); alt_tile_id++) {
+							TileData *tile_data = cast_to<TileData>(tile_set_atlas_source->get_tile_data(atlas_coords, alt_tile_id));
+							if (tile_data) {
+								if (tile_data->get_terrain_set() != TileSet::INVALID_TERRAIN_SET) {
+									add_tile(tile_data, source_id, atlas_coords, alt_tile_id);
+								}
+							}
+						}
+					}
+				}
+			}
+			//Create empty tile. Tiles with different or invalid terrain_set are treated as if they were this empty tile.
+			empty_tile_id = next_tile_id;
+			add_tile(nullptr, TileSet::INVALID_SOURCE, TileSetSource::INVALID_ATLAS_COORDS, TileSetSource::INVALID_TILE_ALTERNATIVE);
+
+			WARN_PRINT("found " + String::num_int64(next_tile_id) + " tiles");
+
+			// Setup neighborship relations
+			for (const KeyValue<int, Tile> &E1 : tiles_by_id) {
+				for (const KeyValue<int, Tile> &E2 : tiles_by_id) {
+					const Tile &center = E1.value;
+					const Tile &neighbor = E2.value;
+					int center_id = E1.key;
+					int neighbor_id = E2.key;
+					adjacency_rules[center_id];
+					CellNeighborIterator cell_neighbor_iterator(tile_set);
+					while (cell_neighbor_iterator.has_next()) {
+						int bit = cell_neighbor_iterator.get_next();
+						int opposing_bit = cell_neighbor_iterator.get_opposing_peering_bit(bit);
+						adjacency_rules[center_id][(TileSet::CellNeighbor)bit];
+						if (center.peering_bits[bit] != neighbor.peering_bits[opposing_bit]) {
+							continue;
+						}
+						if (cell_neighbor_iterator.is_side(bit)) {
+							int successor_cw = cell_neighbor_iterator.get_successor_cw(bit);
+							int successor_ccw = cell_neighbor_iterator.get_successor_cw(bit);
+							int opposing_successor_cw = cell_neighbor_iterator.get_successor_cw(opposing_bit);
+							int opposing_successor_ccw = cell_neighbor_iterator.get_successor_cw(opposing_bit);
+							if ((center.peering_bits[successor_ccw] != neighbor.peering_bits[opposing_successor_cw]) ||
+									(center.peering_bits[successor_cw] != neighbor.peering_bits[opposing_successor_ccw])) {
+								continue;
+							}
+						}
+						adjacency_rules[center_id][(TileSet::CellNeighbor)bit].insert(neighbor_id);
+					}
+				}
+			}
+			for (KeyValue<int, Tile> tile : tiles_by_id) {
+				WARN_PRINT("******");
+				WARN_PRINT("tile " + String::num_int64(tile.key));
+				WARN_PRINT("set: " + String::num_int64(tile.value.terrain_set));
+				WARN_PRINT("index: " + String::num_int64(tile.value.terrain_index));
+				WARN_PRINT("top: " + String::num_int64(tile.value.peering_bits[TileSet::CELL_NEIGHBOR_TOP_SIDE]) + ", right: " + String::num_int64(tile.value.peering_bits[TileSet::CELL_NEIGHBOR_RIGHT_SIDE]) + ", bottom: " + String::num_int64(tile.value.peering_bits[TileSet::CELL_NEIGHBOR_BOTTOM_SIDE]) + ", left: " + String::num_int64(tile.value.peering_bits[TileSet::CELL_NEIGHBOR_LEFT_SIDE]));
+				for (TileSet::CellNeighbor dir : { TileSet::CELL_NEIGHBOR_TOP_SIDE, TileSet::CELL_NEIGHBOR_RIGHT_SIDE, TileSet::CELL_NEIGHBOR_BOTTOM_SIDE, TileSet::CELL_NEIGHBOR_LEFT_SIDE }) {
+					WARN_PRINT("DIR: " + String::num_int64(dir));
+					for (int id : adjacency_rules[tile.key][dir]) {
+						WARN_PRINT("       " + String::num_int64(id));
+					}
+				}
+			}
+		}
+	};
+
+	class WfcProcessor {
+	private:
+		// Internal Types
+
+		static Set<int> set_intersection(const Set<int> &p_a, const Set<int> &p_b) {
+			Set<int> result;
+			for (Set<int>::Element *E = p_a.front(); E; E = E->next()) {
+				if (p_b.has(E->get())) {
+					result.insert(E->get());
+				}
+			}
+			return result;
+		}
+		static Set<int> set_union(const Set<int> &p_a, const Set<int> &p_b) {
+			Set<int> result = p_b;
+			for (Set<int>::Element *E = p_a.front(); E; E = E->next()) {
+				result.insert(E->get());
+			}
+			return result;
+		}
+
+		static bool sets_are_equal(const Set<int> &p_a, const Set<int> &p_b) {
+			if (p_a.size() == p_b.size()) {
+				for (Set<int>::Element *E = p_a.front(); E; E = E->next()) {
+					if (!p_b.has(E->get())) {
+						return false;
+					}
+				}
+				return true;
+			}
+			return false;
+		}
+		struct EntropyCoords {
+			float entropy;
+			Vector2i coords;
+
+			EntropyCoords(){};
+			EntropyCoords(float p_entropy, Vector2i p_coords) :
+					entropy(p_entropy), coords(p_coords) {}
+
+			bool operator<(const EntropyCoords &p_other) const {
+				if (entropy < p_other.entropy) {
+					return true;
+				} else if (entropy == p_other.entropy) {
+					return coords < p_other.coords;
+				} else {
+					return false;
+				}
+			}
+		};
+
+		class Cell {
+		private:
+			const Rules *rules = nullptr;
+			Set<int> allowed_by_constraints;
+			Set<int> allowed_by_neighbors;
+			Map<int, Set<int>> enabled_neighbors;
+			Set<int> probable_tiles;
+			bool collapsed = false;
+			bool needs_update = true;
+
+		public:
+			Cell() {}
+			Cell(const Rules *p_rules) :
+					rules(p_rules) {
+				setAllowedByConstraints(rules->all_tile_ids);
+				setAllowedByNeighbors(rules->all_tile_ids);
+				update();
+			}
+			void setAllowedByConstraints(Set<int> p_allowed_by_constraints) {
+				if (sets_are_equal(allowed_by_constraints, p_allowed_by_constraints)) {
+					return;
+				}
+				allowed_by_constraints = p_allowed_by_constraints;
+				needs_update = true;
+			}
+			void setAllowedByNeighbors(Set<int> p_allowed_by_neigbors) {
+				if (sets_are_equal(allowed_by_neighbors, p_allowed_by_neigbors)) {
+					return;
+				}
+				allowed_by_neighbors = p_allowed_by_neigbors;
+				needs_update = true;
+			}
+			void collapse(const Rules &rules) {
+				ERR_FAIL_COND_MSG(collapsed, "Cell is already collapsed!");
+				WARN_PRINT("collapse Tile: ");
+				if (probable_tiles.is_empty()) {
+					ERR_PRINT("Can't collapse cell: no probable tiles, defaulting to empty tile");
+					collapsed = true;
+					probable_tiles.clear();
+					probable_tiles.insert(rules.empty_tile_id);
+					return;
+				}
+				WARN_PRINT("There are tile to choose from: " + String::num_int64(probable_tiles.size()));
+				int val = rand() % probable_tiles.size();
+				Set<int>::Iterator it = probable_tiles.begin();
+				for (int i = 0; i < val; i++) {
+					++it;
+				}
+				collapsed = true;
+				WARN_PRINT("got tile: " + String::num_int64(*it));
+				probable_tiles.clear();
+				probable_tiles.insert(*it);
+				needs_update = true;
+			}
+
+			void collapse_to_best_scoring_tile() {
+				//TODO: ...
+				WARN_PRINT("Collapsing to best scoring tile, implemante me");
+				probable_tiles.clear();
+				probable_tiles.insert(rules->empty_tile_id);
+				needs_update = true;
+			}
+
+			float get_entropy() const {
+				// TODO: Just a stand-in. Calculate better entropy considering tile probability.
+				return probable_tiles.size();
+			}
+
+			bool is_collapsed() const {
+				return collapsed;
+			}
+
+			const Set<int> &get_probable_tiles() const {
+				return probable_tiles;
+			}
+
+			const Set<int> &get_enabled_tiles(TileSet::CellNeighbor peering_bit) const {
+				return enabled_neighbors[peering_bit];
+			}
+
+			bool update() {
+				ERR_FAIL_COND_V(rules == nullptr, false);
+				if (!needs_update) {
+					return false;
+				}
+
+				Set<int> new_probable_tiles = set_intersection(allowed_by_neighbors, allowed_by_constraints);
+				WARN_PRINT("Tile needs update" + String::num_int64(new_probable_tiles.size()) +
+						" " + String::num_int64(probable_tiles.size()) +
+						" " + String::num_int64(allowed_by_constraints.size()) +
+						" " + String::num_int64(allowed_by_neighbors.size()));
+				if (sets_are_equal(probable_tiles, new_probable_tiles)) {
+					return false;
+				}
+
+				probable_tiles = new_probable_tiles;
+				CellNeighborIterator cell_neighbor_iterator(rules->tile_set);
+				while (cell_neighbor_iterator.has_next()) {
+					int peering_bit = cell_neighbor_iterator.get_next();
+					int opposing_bit = cell_neighbor_iterator.get_opposing_peering_bit(peering_bit);
+					enabled_neighbors[peering_bit] = rules->all_tile_ids;
+					for (int probable_tile : probable_tiles) {
+						enabled_neighbors[opposing_bit] =
+								set_intersection(enabled_neighbors[peering_bit], rules->adjacency_rules[probable_tile][(TileSet::CellNeighbor)peering_bit]);
+					}
+				}
+				needs_update = false;
+				return true;
+			}
+		};
+
+		TileMap *tile_map;
+		Rules rules;
+		Map<Vector2i, Cell> cells;
+		List<Vector2i> changed_coords;
+		Set<EntropyCoords> entropy_coords;
+
+	public:
+		WfcProcessor(TileMap *p_tile_map, const int p_layer, const Rect2i p_region, const int p_use_proxies) :
+				tile_map(p_tile_map), rules(tile_map->tile_set) {
+			// Create cells.
+			TypedArray<Vector2i> used_cells = tile_map->get_used_cells(p_layer);
+			WARN_PRINT("WFC constructor");
+			for (int i = 0; i < used_cells.size(); i++) {
+				Vector2i coords = used_cells[i];
+				if (!p_region.has_point(coords)) {
+					break;
+				}
+				if (tile_map->get_cell_terrain_set(p_layer, coords, p_use_proxies) != TileSet::INVALID_TERRAIN_SET) {
+					int terrain_set = tile_map->get_cell_terrain_set(p_layer, coords, p_use_proxies);
+					int terrain_index = tile_map->get_cell_terrain_index(p_layer, coords, p_use_proxies);
+					Cell new_cell(&rules);
+
+					new_cell.setAllowedByConstraints(rules.ids_by_terrain[terrain_set][terrain_index]);
+
+					cells[coords] = new_cell;
+					changed_coords.push_back(coords);
+				}
+			}
+			propagate_changes();
+			WARN_PRINT("End of WfcProcessor Constructor");
+		}
+		void propagate_changes() {
+			CellNeighborIterator cell_neighbor_iterator(tile_map->tile_set);
+			while (!changed_coords.is_empty()) {
+				Vector2i coords = changed_coords.front()->get();
+				changed_coords.pop_front();
+				Cell &cell = cells[coords];
+
+				cell_neighbor_iterator.reset();
+				Set<int> allowed_by_neighbors = rules.all_tile_ids;
+				while (cell_neighbor_iterator.has_next()) {
+					TileSet::CellNeighbor peering_bit = cell_neighbor_iterator.get_next();
+					TileSet::CellNeighbor opposing_bit = cell_neighbor_iterator.get_opposing_peering_bit(peering_bit);
+					Vector2i neighbor_coords = tile_map->get_neighbor_cell(coords, peering_bit);
+					Set<int> allowed_by_this_neighbor;
+					if (cells.has(neighbor_coords)) {
+						allowed_by_this_neighbor = cells[neighbor_coords].get_enabled_tiles(opposing_bit);
+					} else {
+						allowed_by_this_neighbor = rules.adjacency_rules[rules.empty_tile_id][opposing_bit];
+					}
+					allowed_by_neighbors = set_intersection(allowed_by_neighbors, allowed_by_this_neighbor);
+				}
+
+				cell.setAllowedByNeighbors(allowed_by_neighbors);
+
+				if (cell.update()) {
+					changed_coords.push_back(coords);
+					entropy_coords.insert(EntropyCoords(cell.get_entropy(), coords));
+					CellNeighborIterator cell_neighbor_iterator(tile_map->tile_set);
+					while (cell_neighbor_iterator.has_next()) {
+						Vector2i neighbor_coords = tile_map->get_neighbor_cell(coords, TileSet::CellNeighbor(cell_neighbor_iterator.get_next()));
+						if (cells.has(neighbor_coords)) {
+							changed_coords.push_back(neighbor_coords);
+						}
+					}
+				}
+			}
+		}
+
+		void run() {
+			while (!entropy_coords.is_empty()) {
+				Set<EntropyCoords>::Element *next = entropy_coords.front();
+				entropy_coords.erase(next);
+				Vector2i next_coords = next->get().coords;
+				int next_entropy = next->get().entropy;
+				Cell &cell = cells[next_coords];
+				if (cell.get_entropy() == next_entropy and !cell.is_collapsed()) {
+					cells[next_coords].collapse(rules);
+					changed_coords.push_back(next_coords);
+					propagate_changes();
+				}
+			}
+		}
+
+		Map<Vector2i, TileMapCell> get_result() {
+			Map<Vector2i, TileMapCell> result;
+			for (const KeyValue<Vector2i, Cell> &cell : cells) {
+				//	ERR_FAIL_COND_V(cell.value.probable_tiles.size() != 1, result);
+				ERR_FAIL_COND_V_MSG(!cell.value.is_collapsed(), result, "Cell was not collapsed!");
+				//      WARN_PRINT("good" + String::num_int64(cell.value.probable_tiles.size()));
+				Rules::Tile tile = rules.tiles_by_id[cell.value.get_probable_tiles().front()->get()];
+				result[cell.key] = *rules.tile_map_cells_by_tile[tile].begin();
+			}
+			return result;
+		}
+	};
+
+	if (p_region.get_area() == 0) {
+		p_region = get_used_rect();
+	}
+	WfcProcessor wfc_processor(this, p_layer, p_region, p_use_proxies);
+	wfc_processor.run();
+	for (KeyValue<Vector2i, TileMapCell> cell : wfc_processor.get_result()) {
+		set_cell(p_layer, cell.key, cell.value.source_id, cell.value.get_atlas_coords(), cell.value.alternative_tile);
+	}
+}
+
+TileData *TileMap::get_cell_tile_data(int p_layer, const Vector2i &p_coords, bool p_use_proxies) {
+	if (tile_set.is_valid()) {
+		int source_id = get_cell_source_id(p_layer, p_coords, p_use_proxies);
+		if (source_id != TileSet::INVALID_SOURCE) {
+			Ref<TileSetAtlasSource> tile_set_atlas_source = tile_set->get_source(source_id);
+			if (tile_set_atlas_source.is_valid()) {
+				Vector2i atlas_coords = get_cell_atlas_coords(p_layer, p_coords, p_use_proxies);
+				int alternative_tile = get_cell_alternative_tile(p_layer, p_coords, p_use_proxies);
+				return cast_to<TileData>(tile_set_atlas_source->get_tile_data(atlas_coords, alternative_tile));
+			}
+		}
+	}
+	return nullptr;
+}
+
+TileMapCell TileMap::find_terrain_tile(int p_terrain_set, int p_terrain_index, const int *needed_peering_bits) {
+	ERR_FAIL_INDEX_V(p_terrain_set, tile_set->get_terrain_sets_count(), TileMapCell());
+	ERR_FAIL_INDEX_V(p_terrain_index + 1, tile_set->get_terrains_count(p_terrain_set) + 1, TileMapCell());
+
+	// This Algorithm iterates over all tiles in the tile_map and assigns them a score.
+
+	Map<int, Vector<TileMapCell>> candidate_tiles_by_score;
+	for (int source_id = 0; source_id < tile_set->get_source_count(); source_id++) {
+		Ref<TileSetAtlasSource> tile_set_atlas_source = tile_set->get_source(source_id);
+		if (tile_set_atlas_source.is_valid()) {
+			for (int tile_id = 0; tile_id < tile_set_atlas_source->get_tiles_count(); tile_id++) {
+				Vector2i atlas_coords = tile_set_atlas_source->get_tile_id(tile_id);
+				for (int alt_tile_id = 0; alt_tile_id < tile_set_atlas_source->get_alternative_tiles_count(atlas_coords); alt_tile_id++) {
+					TileData *tile_data = cast_to<TileData>(tile_set_atlas_source->get_tile_data(atlas_coords, alt_tile_id));
+					if (tile_data) {
+						if (tile_data->get_terrain_set() == p_terrain_set && tile_data->get_terrain_index() == p_terrain_index) {
+							if (!needed_peering_bits) {
+								return TileMapCell(source_id, atlas_coords, alt_tile_id);
+							} else {
+								int score = 0;
+								const int SIDE_SCORE = 10;
+								const int CORNER_SCORE = 10;
+								const int TERRAIN_SCORE = 1;
+								Vector<int> neighbors;
+								for (int i = 0; i < TileSet::CELL_NEIGHBOR_MAX; i++) {
+									if (tile_data->is_valid_peering_bit_terrain(TileSet::CellNeighbor(i))) {
+										neighbors.append(i);
+									}
+								}
+								for (int i = 0; i < neighbors.size(); i++) {
+									TileSet::CellNeighbor neighbor = TileSet::CellNeighbor(neighbors[i]);
+									int peering_bit_terrain = tile_data->get_peering_bit_terrain(TileSet::CellNeighbor(neighbor));
+									bool peering_bit_matches_neighbor = needed_peering_bits[neighbor] == peering_bit_terrain;
+									//TODO: Does this work for hexagon tiles?
+									//TODO: This does not work for "match_corners" mode.
+									if (neighbor % 2 == 0) { // It is a side.
+										score += peering_bit_matches_neighbor * SIDE_SCORE;
+									} else { // It is a corner.
+										TileSet::CellNeighbor prev_side = TileSet::CellNeighbor(i > 0 ? neighbors[i - 1] : neighbors[neighbors.size() - 1]);
+										if (prev_side % 2)
+											WARN_PRINT("Not a side1");
+										TileSet::CellNeighbor next_side = TileSet::CellNeighbor(i < neighbors.size() - 1 ? neighbors[i + 1] : neighbors[0]);
+										if (next_side % 2)
+											WARN_PRINT("Not a side2");
+										if ((needed_peering_bits[prev_side] == p_terrain_index) && (needed_peering_bits[next_side] == p_terrain_index)) {
+											score += peering_bit_matches_neighbor * CORNER_SCORE;
+										} else {
+											score += CORNER_SCORE;
+										}
+									}
+									score += (peering_bit_terrain == p_terrain_index) * TERRAIN_SCORE;
+								}
+								candidate_tiles_by_score[score];
+								candidate_tiles_by_score[score].append(TileMapCell(source_id, atlas_coords, alt_tile_id));
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	if (!candidate_tiles_by_score.is_empty()) {
+		// TODO: respect by probability
+		Vector<TileMapCell> candidates = candidate_tiles_by_score.back()->value();
+		return candidates[random() % candidates.size()];
+	} else {
+		WARN_PRINT("No viable terrain tile found.");
+		return TileMapCell();
+	}
+}
+
 TileMapCell TileMap::get_cell(int p_layer, const Vector2i &p_coords, bool p_use_proxies) const {
 	ERR_FAIL_INDEX_V(p_layer, (int)layers.size(), TileMapCell());
 	const Map<Vector2i, TileMapCell> &tile_map = layers[p_layer].tile_map;
@@ -3631,6 +4201,11 @@ void TileMap::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_cell_source_id", "layer", "coords", "use_proxies"), &TileMap::get_cell_source_id);
 	ClassDB::bind_method(D_METHOD("get_cell_atlas_coords", "layer", "coords", "use_proxies"), &TileMap::get_cell_atlas_coords);
 	ClassDB::bind_method(D_METHOD("get_cell_alternative_tile", "layer", "coords", "use_proxies"), &TileMap::get_cell_alternative_tile);
+
+	ClassDB::bind_method(D_METHOD("set_cell_terrain", "layer", "coords", "p_terrain_set", "terrain_index"), &TileMap::set_cell_terrain);
+	ClassDB::bind_method(D_METHOD("get_cell_terrain_set", "layer", "coords", "use_proxies"), &TileMap::get_cell_terrain_set);
+	ClassDB::bind_method(D_METHOD("get_cell_terrain_index", "layer", "coords", "use_proxies"), &TileMap::get_cell_terrain_index);
+	ClassDB::bind_method(D_METHOD("update_cell_terrain_region", "layer", "region", "use_proxies"), &TileMap::update_cell_terrain_region);
 
 	ClassDB::bind_method(D_METHOD("get_coords_for_body_rid", "body"), &TileMap::get_coords_for_body_rid);
 

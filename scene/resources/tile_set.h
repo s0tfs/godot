@@ -199,6 +199,8 @@ public:
 
 public:
 	static const int INVALID_SOURCE; // -1;
+	static const int INVALID_TERRAIN_SET; // -1;
+	static const int INVALID_TERRAIN_INDEX; // -1;
 
 	enum CellNeighbor {
 		CELL_NEIGHBOR_RIGHT_SIDE = 0,
@@ -789,6 +791,7 @@ private:
 
 	// Terrain
 	int terrain_set = -1;
+	int terrain_index = -1;
 	int terrain_peering_bits[16] = { -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 };
 
 	// Navigation
@@ -878,6 +881,8 @@ public:
 	// Terrain
 	void set_terrain_set(int p_terrain_id);
 	int get_terrain_set() const;
+	void set_terrain_index(int p_terrain_index);
+	int get_terrain_index() const;
 	void set_peering_bit_terrain(TileSet::CellNeighbor p_peering_bit, int p_terrain_id);
 	int get_peering_bit_terrain(TileSet::CellNeighbor p_peering_bit) const;
 	bool is_valid_peering_bit_terrain(TileSet::CellNeighbor p_peering_bit) const;
