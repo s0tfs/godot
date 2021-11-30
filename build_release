@@ -1,0 +1,3 @@
+rm ../godot_4.0_projects/TheWarlocksRealm/engine_modules/warlocksrealm/*.o
+./release_build_linux 
+./release_build_windows.bat
