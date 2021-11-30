@@ -446,7 +446,8 @@ void EffectsRD::set_color(RID p_dest_texture, const Color &p_color, const Rect2i
 }
 
 void EffectsRD::gaussian_blur(RID p_source_rd_texture, RID p_texture, RID p_back_texture, const Rect2i &p_region, bool p_8bit_dst) {
-	ERR_FAIL_COND_MSG(!prefer_raster_effects, "Can't use the compute version of the gaussian blur with the mobile renderer.");
+	//ERR_FAIL_COND(!prefer_raster_effects);
+  if (!prefer_raster_effects) return;
 
 	memset(&copy.push_constant, 0, sizeof(CopyPushConstant));
 
@@ -481,7 +482,8 @@ void EffectsRD::gaussian_blur(RID p_source_rd_texture, RID p_texture, RID p_back
 }
 
 void EffectsRD::gaussian_glow(RID p_source_rd_texture, RID p_back_texture, const Size2i &p_size, float p_strength, bool p_high_quality, bool p_first_pass, float p_luminance_cap, float p_exposure, float p_bloom, float p_hdr_bleed_threshold, float p_hdr_bleed_scale, RID p_auto_exposure, float p_auto_exposure_grey) {
-	ERR_FAIL_COND_MSG(prefer_raster_effects, "Can't use the compute version of the gaussian glow with the mobile renderer.");
+//	ERR_FAIL_COND(prefer_raster_effects);
+  if (!prefer_raster_effects) return;
 
 	memset(&copy.push_constant, 0, sizeof(CopyPushConstant));
 

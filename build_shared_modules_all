@@ -1,0 +1,1 @@
+scons -j8 platform=linuxbsd target=release_debug custom_modules=../godot_4.0_projects/TheWarlocksRealm/engine_modules shared_modules=yes 
